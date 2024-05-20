@@ -1,126 +1,84 @@
 import argparse
-import glob
 import json
-import os
-from typing import TYPE_CHECKING
+import sys
+from io import StringIO
+from unittest.mock import patch
 
-if TYPE_CHECKING:
-    from typing import Dict
-
-
-def list_slowest_tests() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--durations-path",
-        help=(
-            "Path to the file in which durations are stored, "
-            "default is .test_durations in the current working directory"
-        ),
-        default=".test_durations",
-        type=argparse.FileType(),
-    )
-    parser.add_argument(
-        "-c",
-        "--count",
-        help="How many slowest to list",
-        default=10,
-        type=int,
-    )
-    args = parser.parse_args()
-    return _list_slowest_tests(json.load(args.durations_path), args.count)
+import pytest
+from pytest_split import cli
 
 
-def _list_slowest_tests(durations: "Dict[str, float]", count: int) -> None:
-    slowest_tests = tuple(
-        sorted(durations.items(), key=lambda item: item[1], reverse=True)
-    )[:count]
-    for test, duration in slowest_tests:
-        print(f"{duration:.2f} {test}")  # noqa: T201
-
-
-def run_combine_tests() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--durations-path",
-        help=(
-            "Path to the file in which durations are stored, "
-            "default is .test_durations in the current working directory"
-        ),
-        default=".test_durations",
-        type=str,
-    )
-    parser.add_argument(
-        "--durations-pattern",
-        help=(
-            "Pattern to match the files in which durations are stored, "
-            "default is */.test_durations in the current working directory"
-        ),
-        default="*/.test_durations",
-        type=str,
-    )
-    parser.add_argument(
-        "--root-folder",
-        help=(
-            "Path to the folder where to run the command"
-            "default is . to run in the current working directory"
-        ),
-        default=".",
-        type=str,
-    )
-    parser.add_argument("--keep_original", action="store_true", default=False)
-
-    args = parser.parse_args()
-
-    return _run_combine_tests(
-        args.durations_path,
-        args.durations_pattern,
-        args.root_folder,
-        keep_original=args.keep_original,
-    )
-
-
-def _run_combine_tests(
-    durations_path: str,
-    durations_pattern: str,
-    root_folder: str,
-    *,
-    keep_original: bool,
-) -> None:
-    """
-    Combines JSON files matching a pattern into a single object and writes it to an output file.
-
-    Args:
-        durations_pattern (str): A file pattern (e.g., "data_*.json") to match JSON files.
-        durations_path (str): The path to the output file where the combined data will be written.
-
-    """
-    combined_data = {}
-    filenames = glob.glob(durations_pattern, root_dir=root_folder)
-
-    if not filenames:
-        print(  # noqa: T201
-            f"No file found with pattern {durations_pattern} in {root_folder}"
-        )
-        return
-
-    try:
-        for filename in filenames:
-            fullpath_filename = os.path.join(root_folder, filename)
-            with open(fullpath_filename) as f:
-                data = json.load(f)
-            combined_data.update(data)  # Efficiently merge dictionaries
-    except (OSError, json.JSONDecodeError) as e:
-        print(f"Error processing file '{filename}': {e}")  # noqa: T201
-        return
-
-    if keep_original:
-        with open(durations_path) as f:
-            data = json.load(f)
-        combined_data.update(data)
-
-    print(  # noqa: T201
-        f"{len(filenames)} files combined, with a total of {len(combined_data)} entries"
-    )
-
+@pytest.fixture()
+def durations_file(tmpdir):
+    durations_path = str(tmpdir.join(".durations"))
+    durations = {f"test_{i}": float(i) for i in range(1, 11)}
     with open(durations_path, "w") as f:
-        json.dump(combined_data, f, indent=4)  # Write with indentation
+        json.dump(durations, f)
+    with open(durations_path) as f:
+        yield f
+
+
+def test_slowest_tests(durations_file):
+    with patch(
+        "pytest_split.cli.argparse.ArgumentParser", autospec=True
+    ) as arg_parser, patch("sys.stdout", new_callable=StringIO):
+        arg_parser().parse_args.return_value = argparse.Namespace(
+            durations_path=durations_file, count=3
+        )
+        cli.list_slowest_tests()
+
+        output = sys.stdout.getvalue()  # type: ignore[attr-defined]
+        assert output == ("10.00 test_10\n9.00 test_9\n8.00 test_8\n")
+
+
+@pytest.fixture()
+def multiple_durations_files(tmpdir):
+    files_paths = []
+    for combine_i in range(1, 5):
+        tmpdir.mkdir(f"{combine_i}_folder")
+        durations_path = str(tmpdir.join(f"{combine_i}_folder").join(".durations"))
+        durations = {f"test_{combine_i}_{i}": float(i) for i in range(1, 11)}
+        with open(durations_path, "w") as f:
+            json.dump(durations, f)
+        files_paths.append(durations_path)
+
+    return files_paths
+
+
+def test_combine_tests(durations_file, multiple_durations_files, tmpdir):
+    durations_path = durations_file.name
+    new_durations_files = len(multiple_durations_files)
+    new_durations = new_durations_files * 10
+
+    with patch(
+        "pytest_split.cli.argparse.ArgumentParser", autospec=True
+    ) as arg_parser, patch("sys.stdout", new_callable=StringIO):
+        arg_parser().parse_args.return_value = argparse.Namespace(
+            durations_path=durations_path,
+            durations_pattern="*/.durations",
+            root_folder=tmpdir,
+            keep_original=True,
+        )
+        cli.run_combine_tests()
+
+        output = sys.stdout.getvalue()  # type: ignore[attr-defined]
+        assert output == (
+            f"{new_durations_files} files combined, with a total of {new_durations+10} entries\n"
+        )
+
+    # Test not keeping original
+    with patch(
+        "pytest_split.cli.argparse.ArgumentParser", autospec=True
+    ) as arg_parser, patch("sys.stdout", new_callable=StringIO):
+        arg_parser().parse_args.return_value = argparse.Namespace(
+            durations_path=durations_path,
+            durations_pattern="*/.durations",
+            root_folder=tmpdir,
+            keep_original=False,
+        )
+        cli.run_combine_tests()
+
+        output = sys.stdout.getvalue()  # type: ignore[attr-defined]
+        assert output == (
+            f"{new_durations_files} files combined, with a total of {new_durations} entries\n"
+        )
